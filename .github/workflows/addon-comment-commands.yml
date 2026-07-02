@@ -7,6 +7,9 @@ on:
 permissions:
   contents: write
   issues: write
+  discussions: write
+  pages: write
+  id-token: write
 
 jobs:
   handle-command:
@@ -23,7 +26,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const { validateUpdate, replaceTargetRef, inferRequestType } = require('./scripts/addon-request.cjs');
+            const { validateUpdate, replaceTargetRef, inferRequestType, findAddonForUpdate } = require('./scripts/addon-request.cjs');
 
             const body = (context.payload.comment.body || '').trim();
             const issueBody = context.payload.issue.body || '';
@@ -56,8 +59,10 @@ jobs:
             core.setOutput('commit_policy', 'false');
             core.setOutput('close', 'false');
             core.setOutput('message', '');
+            core.setOutput('request_type', requestType);
+            core.setOutput('discussion_id', requestType === 'update' ? (findAddonForUpdate(issueBody)?.discussion?.id || '') : '');
 
-            if (!['/approve', '/ban', '/trust', '/bump'].includes(command)) {
+            if (!['/approve', '/deny', '/ban', '/trust', '/bump'].includes(command)) {
               core.notice('No addon command found; ignoring comment.');
               return;
             }
@@ -67,7 +72,7 @@ jobs:
               return;
             }
 
-            if (command === '/ban' || command === '/trust' || command === '/approve') {
+            if (command === '/ban' || command === '/trust' || command === '/approve' || command === '/deny') {
               if (!(await requireWritePermission())) return;
             }
 
@@ -87,7 +92,7 @@ jobs:
 
                 const canApplyCurrent = requestType === 'update' && user === issueUser;
                 if (canApplyCurrent) {
-                  const result = validateUpdate(issueBody, { user, trusted: true, banned: false });
+                  const result = validateUpdate(issueBody, { user, userId: context.payload.issue.user.id, trusted: true, banned: false });
                   if (result.errors.length === 0) {
                     core.setOutput('apply', 'true');
                     core.setOutput('close', 'true');
@@ -133,7 +138,15 @@ jobs:
             if (command === '/approve') {
               core.setOutput('apply', 'true');
               core.setOutput('close', 'true');
-              core.setOutput('message', '✅ Approved and applied. The marketplace file was updated, and deployment should start from the pushed commit.');
+              core.setOutput('message', '✅ Your addon marketplace request has been approved and applied. Thanks for contributing to the OpenGameInstaller addon ecosystem! The marketplace will update after GitHub Pages deploys the new commit.');
+            }
+
+            if (command === '/deny') {
+              const reason = body.replace(/^\/deny\s*/i, '').trim();
+              core.setOutput('close', 'true');
+              core.setOutput('message', reason
+                ? `❌ Your addon marketplace request was denied by a maintainer.\n\n**Reason:** ${reason}`
+                : '❌ Your addon marketplace request was denied by a maintainer.');
             }
 
       - name: Commit request policy
@@ -149,11 +162,68 @@ jobs:
           git commit -m "chore(addon requests): update trust policy"
           git push
 
+      - name: Create addon discussion
+        id: discussion
+        if: steps.command.outputs.apply == 'true' && steps.command.outputs.request_type == 'create'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { parseCreatePayload } = require('./scripts/addon-request.cjs');
+            const payload = parseCreatePayload(context.payload.issue.body || '');
+
+            const repoData = await github.graphql(`
+              query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  id
+                  discussionCategories(first: 25) {
+                    nodes { id name slug }
+                  }
+                }
+              }
+            `, { owner: context.repo.owner, repo: context.repo.repo });
+
+            const categories = repoData.repository.discussionCategories.nodes;
+            const category = categories.find((entry) => ['addons', 'addon', 'show-and-tell', 'announcements', 'general'].includes(entry.slug)) || categories[0];
+            if (!category) throw new Error('No GitHub Discussions category found. Enable Discussions and create at least one category.');
+
+            const body = [
+              `Addon submitted by @${context.payload.issue.user.login} via #${context.payload.issue.number}.`,
+              '',
+              `**Repository:** ${payload.source}`,
+              `**Author:** ${payload.author}`,
+              `**Pinned target:** ${payload.targetRef || 'latest created tag resolved during approval'}`,
+              '',
+              '## Description',
+              payload.description,
+            ].join('\n');
+
+            const result = await github.graphql(`
+              mutation($repositoryId: ID!, $categoryId: ID!, $title: String!, $body: String!) {
+                createDiscussion(input: { repositoryId: $repositoryId, categoryId: $categoryId, title: $title, body: $body }) {
+                  discussion { id url number }
+                }
+              }
+            `, {
+              repositoryId: repoData.repository.id,
+              categoryId: category.id,
+              title: `Addon: ${payload.name}`,
+              body,
+            });
+
+            core.setOutput('id', result.createDiscussion.discussion.id);
+            core.setOutput('url', result.createDiscussion.discussion.url);
+            core.setOutput('number', String(result.createDiscussion.discussion.number));
+
       - name: Apply marketplace change
         if: steps.command.outputs.apply == 'true'
         env:
           ISSUE_BODY: ${{ github.event.issue.body }}
           ISSUE_LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
+          ADDON_REQUESTER_ID: ${{ github.event.issue.user.id }}
+          ADDON_SUBMITTER_ID: ${{ github.event.issue.user.id }}
+          ADDON_SUBMITTER_LOGIN: ${{ github.event.issue.user.login }}
+          ADDON_DISCUSSION_ID: ${{ steps.discussion.outputs.id }}
+          ADDON_DISCUSSION_URL: ${{ steps.discussion.outputs.url }}
         run: node scripts/addon-request.cjs apply-by-label
 
       - name: Commit marketplace change
@@ -166,6 +236,42 @@ jobs:
           git add marketplace.json api/marketplace.json .github/ISSUE_TEMPLATE/addon-update.yml
           git commit -m "chore(addons): apply marketplace request from issue #${{ github.event.issue.number }}"
           git push
+
+      - uses: actions/configure-pages@v5
+        if: steps.command.outputs.apply == 'true'
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.command.outputs.apply == 'true'
+        with:
+          path: _site
+
+      - name: Deploy GitHub Pages
+        if: steps.command.outputs.apply == 'true'
+        uses: actions/deploy-pages@v4
+
+      - name: Post update decision to discussion
+        if: steps.command.outputs.request_type == 'update' && steps.command.outputs.discussion_id != '' && (steps.command.outputs.command == '/approve' || steps.command.outputs.command == '/deny')
+        uses: actions/github-script@v7
+        env:
+          COMMAND_MESSAGE: ${{ steps.command.outputs.message }}
+        with:
+          script: |
+            const status = '${{ steps.command.outputs.command }}' === '/approve' ? 'approved' : 'denied';
+            const body = [
+              status === 'approved' ? '✅ Addon update approved.' : '❌ Addon update denied.',
+              '',
+              process.env.COMMAND_MESSAGE,
+              '',
+              `Issue: #${context.payload.issue.number}`,
+            ].join('\n');
+
+            await github.graphql(`
+              mutation($discussionId: ID!, $body: String!) {
+                addDiscussionComment(input: { discussionId: $discussionId, body: $body }) {
+                  comment { id }
+                }
+              }
+            `, { discussionId: '${{ steps.command.outputs.discussion_id }}', body });
 
       - name: Comment and close
         if: steps.command.outputs.message != ''

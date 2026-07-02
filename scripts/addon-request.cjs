@@ -43,6 +43,13 @@ function readMarketplace(path = 'marketplace.json') {
   return { marketplace, addons: marketplace };
 }
 
+function findAddonForUpdate(body) {
+  const payload = parseUpdatePayload(body);
+  if (!payload.addonId) return undefined;
+  const { addons } = readMarketplace();
+  return addons.find((entry) => inferAddonId(entry) === payload.addonId);
+}
+
 function getFieldByPrefix(fields, prefix) {
   return Object.entries(fields).find(([key]) => key.startsWith(prefix))?.[1] || '';
 }
@@ -107,6 +114,12 @@ function validateUrl(value, label, errors) {
   }
 }
 
+function requesterOwnsAddon(addon, requesterId) {
+  const ownerId = addon?.submittedBy?.id || addon?.submitter?.id || addon?.githubUserId || addon?.github_user_id;
+  if (!ownerId || !requesterId) return true;
+  return String(ownerId) === String(requesterId);
+}
+
 function validateUpdate(body, options = {}) {
   const payload = parseUpdatePayload(body);
   const errors = [];
@@ -121,6 +134,7 @@ function validateUpdate(body, options = {}) {
     addon = addons.find((entry) => inferAddonId(entry) === payload.addonId);
     if (!addon) errors.push('No matching addon ID was found in marketplace.json.');
     if (addon && !addonSource(addon)) errors.push('Marketplace entry is missing a source field.');
+    if (addon && !requesterOwnsAddon(addon, options.userId)) errors.push('Only the original addon submitter can request updates for this addon.');
   } catch (error) {
     errors.push(`Could not read marketplace.json: ${error.message}`);
   }
@@ -134,6 +148,7 @@ function validateUpdate(body, options = {}) {
     `**Repository:** ${repoUrl || '_inferred after addon match_'}`,
     `**Requested target:** ${payload.targetRef || '_latest created tag will be resolved on approval_'}`,
     addon ? `**Current pinned commit/ref:** ${addon.pinnedCommit || '_unset_'}` : '',
+    addon?.submittedBy?.login ? `**Original submitter:** @${addon.submittedBy.login}` : '',
     options.trusted ? `**Requester trust:** @${options.user} is trusted; this request can be auto-approved.` : '',
     '',
     errors.length ? `❌ **Validation failed**\n\n${errors.map((error) => `- ${error}`).join('\n')}` : '✅ **Validation passed**',
@@ -190,7 +205,9 @@ function validateCreate(body, options = {}) {
     '- If the target ref is blank, approval resolves it to the newest created Git tag commit from the addon repository.',
     '- Maintainers can add the addon by commenting `/approve`.',
     '- The issue creator can change the requested ref before approval with `/bump <commit|tag|branch>`.',
-    '- When approved, the workflow adds the addon to `marketplace.json`, refreshes the generated Pages API file, commits the change, and closes this issue.',
+    '- When approved, the workflow creates a GitHub Discussion for the addon and records the submitter GitHub user ID.',
+    '- Future update requests for this addon must be opened by the original submitter.',
+    '- The workflow adds the addon to `marketplace.json`, refreshes the generated Pages API file, commits the change, and closes this issue.',
     '',
     errors.length ? 'Edit the issue to fix the problems above.' : 'A maintainer with write access can add this addon by commenting `/approve`.',
   ].filter(Boolean).join('\n');
@@ -198,7 +215,7 @@ function validateCreate(body, options = {}) {
   return { payload, duplicate, errors, summary };
 }
 
-function applyUpdate(body) {
+function applyUpdate(body, options = {}) {
   const payload = parseUpdatePayload(body);
   if (!payload.addonId || payload.addonId === 'no-addons-available') throw new Error('Missing required field: addonId');
   if (!payload.notes) throw new Error('Missing required field: notes');
@@ -206,6 +223,10 @@ function applyUpdate(body) {
   const { marketplace: addons } = readMarketplace();
   const addon = addons.find((entry) => inferAddonId(entry) === payload.addonId);
   if (!addon) throw new Error(`No matching addon found for ID ${payload.addonId}`);
+
+  if (!requesterOwnsAddon(addon, options.userId || process.env.ADDON_REQUESTER_ID)) {
+    throw new Error('Only the original addon submitter can update this addon.');
+  }
 
   const source = addonSource(addon);
   if (!source) throw new Error('Marketplace entry is missing a source field.');
@@ -218,13 +239,18 @@ function applyUpdate(body) {
   return { payload, pinnedCommit: addon.pinnedCommit };
 }
 
-function applyCreate(body) {
+function applyCreate(body, options = {}) {
   const validation = validateCreate(body);
   if (validation.errors.length) throw new Error(validation.errors.join('\n'));
 
   const payload = validation.payload;
   const { marketplace: addons } = readMarketplace();
   const pinnedCommit = resolveTargetRef(payload.source, payload.targetRef);
+  const submitterId = options.submitterId || process.env.ADDON_SUBMITTER_ID;
+  const submitterLogin = options.submitterLogin || process.env.ADDON_SUBMITTER_LOGIN;
+  const discussionUrl = options.discussionUrl || process.env.ADDON_DISCUSSION_URL;
+  const discussionId = options.discussionId || process.env.ADDON_DISCUSSION_ID;
+
   const addon = {
     name: payload.name,
     author: payload.author,
@@ -232,7 +258,18 @@ function applyCreate(body) {
     img: payload.img,
     pinnedCommit,
     description: payload.description,
+    submittedBy: {
+      id: submitterId ? String(submitterId) : undefined,
+      login: submitterLogin || undefined,
+    },
+    discussion: discussionUrl || discussionId ? {
+      id: discussionId || undefined,
+      url: discussionUrl || undefined,
+    } : undefined,
   };
+
+  if (!addon.submittedBy.id && !addon.submittedBy.login) delete addon.submittedBy;
+  if (!addon.discussion) delete addon.discussion;
 
   addons.push(addon);
   addons.sort((a, b) => a.name.localeCompare(b.name));
@@ -250,10 +287,10 @@ function inferRequestType(body, labels = []) {
   return '';
 }
 
-function applyByLabel(body, labels = []) {
+function applyByLabel(body, labels = [], options = {}) {
   const type = inferRequestType(body, labels);
-  if (type === 'create') return applyCreate(body);
-  if (type === 'update') return applyUpdate(body);
+  if (type === 'create') return applyCreate(body, options);
+  if (type === 'update') return applyUpdate(body, options);
   throw new Error('Issue is not an addon creation or update request.');
 }
 
@@ -268,9 +305,12 @@ module.exports = {
   parseIssueForm,
   parseUpdatePayload,
   parseCreatePayload,
+  readMarketplace,
+  findAddonForUpdate,
   validate: validateUpdate,
   validateUpdate,
   validateCreate,
+  requesterOwnsAddon,
   applyUpdate,
   applyCreate,
   inferRequestType,
@@ -292,11 +332,11 @@ if (require.main === module) {
   } else if (command === 'validate-create') {
     process.stdout.write(JSON.stringify(validateCreate(body, options)));
   } else if (command === 'apply-update' || command === 'apply') {
-    process.stdout.write(JSON.stringify(applyUpdate(body)));
+    process.stdout.write(JSON.stringify(applyUpdate(body, { userId: process.env.ADDON_REQUESTER_ID })));
   } else if (command === 'apply-create') {
     process.stdout.write(JSON.stringify(applyCreate(body)));
   } else if (command === 'apply-by-label') {
-    process.stdout.write(JSON.stringify(applyByLabel(body, (process.env.ISSUE_LABELS || '').split(',').filter(Boolean))));
+    process.stdout.write(JSON.stringify(applyByLabel(body, (process.env.ISSUE_LABELS || '').split(',').filter(Boolean), { userId: process.env.ADDON_REQUESTER_ID })));
   } else if (command === 'bump') {
     process.stdout.write(replaceTargetRef(body, process.env.BUMP_REF || process.argv[3] || ''));
   } else {

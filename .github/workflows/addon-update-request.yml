@@ -7,6 +7,9 @@ on:
 permissions:
   contents: write
   issues: write
+  discussions: write
+  pages: write
+  id-token: write
 
 jobs:
   reject-banned-addon-request:
@@ -59,6 +62,7 @@ jobs:
             const user = issue.user.login;
             const result = validate(issue.body || '', {
               user,
+              userId: issue.user.id,
               banned: (policy.bannedUsers || []).includes(user),
               trusted: (policy.trustedUsers || []).includes(user),
             });
@@ -69,6 +73,24 @@ jobs:
               issue_number: issue.number,
               body: result.summary,
             });
+
+            if (context.payload.action === 'opened' && result.addon?.discussion?.id) {
+              const discussionBody = [
+                `📬 Update requested by @${user} in #${issue.number}.`,
+                '',
+                `**Requested target:** ${result.payload.targetRef || 'latest created tag on approval'}`,
+                `**Validation:** ${result.errors.length ? 'failed' : 'passed'}`,
+                result.errors.length ? `**Errors:**\n${result.errors.map((error) => `- ${error}`).join('\n')}` : '',
+              ].filter(Boolean).join('\n');
+
+              await github.graphql(`
+                mutation($discussionId: ID!, $body: String!) {
+                  addDiscussionComment(input: { discussionId: $discussionId, body: $body }) {
+                    comment { id }
+                  }
+                }
+              `, { discussionId: result.addon.discussion.id, body: discussionBody });
+            }
 
             if ((policy.bannedUsers || []).includes(user)) {
               await github.rest.issues.update({
@@ -195,7 +217,7 @@ jobs:
             const user = '${{ steps.policy.outputs.user }}';
             const isAddonUpdate = context.payload.issue.labels.some((label) => label.name === 'addon-update');
             const isIssueCreator = user === context.payload.issue.user.login;
-            const result = validate(context.payload.issue.body || '', { user, trusted: true, banned: false });
+            const result = validate(context.payload.issue.body || '', { user, userId: context.payload.issue.user.id, trusted: true, banned: false });
             core.setOutput('apply', String(command === 'trust' && isAddonUpdate && isIssueCreator && result.errors.length === 0));
 
       - name: Apply current trusted update
@@ -203,6 +225,7 @@ jobs:
         env:
           ISSUE_BODY: ${{ github.event.issue.body }}
           ISSUE_LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
+          ADDON_REQUESTER_ID: ${{ github.event.issue.user.id }}
         run: node scripts/addon-request.cjs apply-by-label
 
       - name: Commit current trusted update
@@ -215,6 +238,18 @@ jobs:
           git add marketplace.json api/marketplace.json .github/ISSUE_TEMPLATE/addon-update.yml
           git commit -m "chore(addons): trust and approve update from issue #${{ github.event.issue.number }}"
           git push
+
+      - uses: actions/configure-pages@v5
+        if: steps.trusted_current.outputs.apply == 'true'
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.trusted_current.outputs.apply == 'true'
+        with:
+          path: _site
+
+      - name: Deploy GitHub Pages
+        if: steps.trusted_current.outputs.apply == 'true'
+        uses: actions/deploy-pages@v4
 
       - name: Comment and close if needed
         uses: actions/github-script@v7
@@ -313,14 +348,16 @@ jobs:
             const user = context.payload.issue.user.login;
             const trusted = (policy.trustedUsers || []).includes(user);
             const banned = (policy.bannedUsers || []).includes(user);
-            const result = validate(context.payload.issue.body || '', { user, trusted, banned });
+            const result = validate(context.payload.issue.body || '', { user, userId: context.payload.issue.user.id, trusted, banned });
             core.setOutput('apply', String(trusted && !banned && result.errors.length === 0));
+            core.setOutput('discussion_id', result.addon?.discussion?.id || '');
 
       - name: Apply trusted marketplace update
         if: steps.check.outputs.apply == 'true'
         env:
           ISSUE_BODY: ${{ github.event.issue.body }}
           ISSUE_LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
+          ADDON_REQUESTER_ID: ${{ github.event.issue.user.id }}
         run: node scripts/addon-request.cjs apply-by-label
 
       - name: Commit trusted marketplace update
@@ -333,6 +370,37 @@ jobs:
           git add marketplace.json api/marketplace.json .github/ISSUE_TEMPLATE/addon-update.yml
           git commit -m "chore(addons): auto-approve trusted update from issue #${{ github.event.issue.number }}"
           git push
+
+      - uses: actions/configure-pages@v5
+        if: steps.check.outputs.apply == 'true'
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.check.outputs.apply == 'true'
+        with:
+          path: _site
+
+      - name: Deploy GitHub Pages
+        if: steps.check.outputs.apply == 'true'
+        uses: actions/deploy-pages@v4
+
+      - name: Post trusted update approval to discussion
+        if: steps.check.outputs.apply == 'true' && steps.check.outputs.discussion_id != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = [
+              '✅ Addon update automatically approved for trusted requester.',
+              '',
+              `Issue: #${context.payload.issue.number}`,
+            ].join('\n');
+
+            await github.graphql(`
+              mutation($discussionId: ID!, $body: String!) {
+                addDiscussionComment(input: { discussionId: $discussionId, body: $body }) {
+                  comment { id }
+                }
+              }
+            `, { discussionId: '${{ steps.check.outputs.discussion_id }}', body });
 
       - name: Comment and close trusted request
         if: steps.check.outputs.apply == 'true'
@@ -393,6 +461,7 @@ jobs:
         env:
           ISSUE_BODY: ${{ github.event.issue.body }}
           ISSUE_LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
+          ADDON_REQUESTER_ID: ${{ github.event.issue.user.id }}
         run: node scripts/addon-request.cjs apply-by-label
 
       - name: Commit marketplace update
@@ -404,6 +473,15 @@ jobs:
           git add marketplace.json api/marketplace.json .github/ISSUE_TEMPLATE/addon-update.yml
           git commit -m "chore(addons): approve marketplace request from issue #${{ github.event.issue.number }}"
           git push
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy GitHub Pages
+        uses: actions/deploy-pages@v4
 
       - name: Comment and close issue
         uses: actions/github-script@v7

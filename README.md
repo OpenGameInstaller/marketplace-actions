@@ -9,6 +9,7 @@ The marketplace is deployed to GitHub Pages and is available at `/api/marketplac
 On addon submission and update issues:
 
 - `/approve` adds a submitted addon or applies the requested update.
+- `/deny [reason]` denies and closes an addon submission or update request.
 - `/ban [@user]` bans the issue creator, or the mentioned user, from addon creation/update requests.
 - `/trust [@user]` trusts the issue creator, or the mentioned user, and auto-approves their valid addon update requests.
 - `/bump <commit|tag|branch>` can be used by the issue creator to change the requested target ref.
