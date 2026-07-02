@@ -11,6 +11,37 @@ permissions:
   issues: write
 
 jobs:
+  reject-banned-addon-request:
+    if: >-
+      github.event_name == 'issues' &&
+      !contains(github.event.issue.labels.*.name, 'addon-update') &&
+      (contains(github.event.issue.labels.*.name, 'addon-create') || contains(github.event.issue.labels.*.name, 'addon-creation'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Close banned addon requesters
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const policy = JSON.parse(fs.readFileSync('.github/addon-request-policy.json', 'utf8'));
+            const user = context.payload.issue.user.login;
+            if (!(policy.bannedUsers || []).includes(user)) return;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `🚫 @${user} is banned from addon creation/update requests in this repository.`,
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              state: 'closed',
+              state_reason: 'not_planned',
+            });
+
   validate-request:
     if: >-
       github.event_name == 'issues' &&
@@ -23,74 +54,263 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const { validate } = require('./scripts/addon-update-request.cjs');
             const fs = require('fs');
-
-            function parseIssueForm(body) {
-              const fields = {};
-              const regex = /###\s+(.+?)\s*\n+([\s\S]*?)(?=\n###\s+|$)/g;
-              for (const match of body.matchAll(regex)) {
-                const key = match[1].trim().toLowerCase();
-                const value = match[2]
-                  .replace(/<!--[\s\S]*?-->/g, '')
-                  .trim();
-                fields[key] = value;
-              }
-              return fields;
-            }
-
-            function normalizeUrl(url) {
-              return String(url || '')
-                .trim()
-                .replace(/\.git$/, '')
-                .replace(/\/$/, '')
-                .toLowerCase();
-            }
-
             const issue = context.payload.issue;
-            const fields = parseIssueForm(issue.body || '');
-            const addonName = fields['addon name'];
-            const repoUrl = fields['repository url'];
-            const targetRef = fields['target commit, tag, or branch'];
-            const notes = fields['update notes'];
-            const errors = [];
-
-            if (!addonName) errors.push('Missing addon name.');
-            if (!repoUrl) errors.push('Missing repository URL.');
-            if (!targetRef) errors.push('Missing target commit, tag, or branch.');
-            if (!notes) errors.push('Missing update notes.');
-
-            let addon;
-            try {
-              const marketplace = JSON.parse(fs.readFileSync('marketplace.json', 'utf8'));
-              addon = (marketplace.addons || []).find((entry) => {
-                return entry.name === addonName || normalizeUrl(entry.git || entry.repositoryUrl || entry.url) === normalizeUrl(repoUrl);
-              });
-              if (!addon) errors.push('No matching addon was found in marketplace.json.');
-              if (addon && repoUrl && normalizeUrl(addon.git || addon.repositoryUrl || addon.url) !== normalizeUrl(repoUrl)) {
-                errors.push('Repository URL does not match the marketplace entry.');
-              }
-            } catch (error) {
-              errors.push(`Could not read marketplace.json: ${error.message}`);
-            }
-
-            const summary = [
-              '## Addon update request validation',
-              '',
-              `**Addon:** ${addonName || '_missing_'}`,
-              `**Repository:** ${repoUrl || '_missing_'}`,
-              `**Requested target:** ${targetRef || '_missing_'}`,
-              addon ? `**Current pinned commit/ref:** ${addon.pinnedCommit || addon.targetRef || '_unset_'}` : '',
-              '',
-              errors.length ? `❌ **Validation failed**\n\n${errors.map((error) => `- ${error}`).join('\n')}` : '✅ **Validation passed**',
-              '',
-              errors.length ? 'Edit the issue to fix the problems above.' : 'A maintainer with write access can approve this update by commenting `/approve`.',
-            ].filter(Boolean).join('\n');
+            const policy = JSON.parse(fs.readFileSync('.github/addon-request-policy.json', 'utf8'));
+            const user = issue.user.login;
+            const result = validate(issue.body || '', {
+              user,
+              banned: (policy.bannedUsers || []).includes(user),
+              trusted: (policy.trustedUsers || []).includes(user),
+            });
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: issue.number,
-              body: summary,
+              body: result.summary,
+            });
+
+            if ((policy.bannedUsers || []).includes(user)) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'not_planned',
+              });
+            }
+
+  manage-request-users:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null &&
+      (startsWith(github.event.comment.body, '/ban') || startsWith(github.event.comment.body, '/trust'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check moderator permission
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.payload.comment.user.login,
+            });
+            if (!['admin', 'maintain', 'write'].includes(data.permission)) {
+              core.setFailed(`@${context.payload.comment.user.login} has ${data.permission} permission; write access is required.`);
+            }
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update request policy
+        id: policy
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = '.github/addon-request-policy.json';
+            const policy = fs.existsSync(path) ? JSON.parse(fs.readFileSync(path, 'utf8')) : {};
+            policy.bannedUsers ||= [];
+            policy.trustedUsers ||= [];
+
+            const body = context.payload.comment.body.trim();
+            const command = body.startsWith('/ban') ? 'ban' : 'trust';
+            const mention = body.match(/@([A-Za-z0-9-]+)/)?.[1];
+            const user = mention || context.payload.issue.user.login;
+
+            if (command === 'ban') {
+              if (!policy.bannedUsers.includes(user)) policy.bannedUsers.push(user);
+              policy.trustedUsers = policy.trustedUsers.filter((entry) => entry !== user);
+            } else {
+              if (!policy.trustedUsers.includes(user)) policy.trustedUsers.push(user);
+              policy.bannedUsers = policy.bannedUsers.filter((entry) => entry !== user);
+            }
+
+            policy.bannedUsers.sort((a, b) => a.localeCompare(b));
+            policy.trustedUsers.sort((a, b) => a.localeCompare(b));
+            fs.writeFileSync(path, `${JSON.stringify(policy, null, 2)}\n`);
+            core.setOutput('command', command);
+            core.setOutput('user', user);
+
+      - name: Commit request policy
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/addon-request-policy.json
+          if git diff --cached --quiet; then
+            echo "Policy already up to date."
+            exit 0
+          fi
+          git commit -m "chore(addon requests): ${{ steps.policy.outputs.command }} ${{ steps.policy.outputs.user }}"
+          git push
+
+      - name: Check current trusted request
+        id: trusted_current
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { validate } = require('./scripts/addon-update-request.cjs');
+            const command = '${{ steps.policy.outputs.command }}';
+            const user = '${{ steps.policy.outputs.user }}';
+            const isAddonUpdate = context.payload.issue.labels.some((label) => label.name === 'addon-update');
+            const isIssueCreator = user === context.payload.issue.user.login;
+            const result = validate(context.payload.issue.body || '', { user, trusted: true, banned: false });
+            core.setOutput('apply', String(command === 'trust' && isAddonUpdate && isIssueCreator && result.errors.length === 0));
+
+      - name: Apply current trusted update
+        if: steps.trusted_current.outputs.apply == 'true'
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: node scripts/addon-update-request.cjs apply
+
+      - name: Commit current trusted update
+        if: steps.trusted_current.outputs.apply == 'true'
+        run: |
+          node scripts/update-addon-issue-template.mjs
+          node scripts/sync-pages-api.mjs
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add marketplace.json api/marketplace.json .github/ISSUE_TEMPLATE/addon-update.yml
+          git commit -m "chore(addons): trust and approve update from issue #${{ github.event.issue.number }}"
+          git push
+
+      - name: Comment and close if needed
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const command = '${{ steps.policy.outputs.command }}';
+            const user = '${{ steps.policy.outputs.user }}';
+            const applied = '${{ steps.trusted_current.outputs.apply }}' === 'true';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: command === 'ban'
+                ? `🚫 @${user} is now banned from addon creation/update requests in this repository.`
+                : (applied
+                  ? `✅ @${user} is now trusted, and this addon update was automatically approved and applied.`
+                  : `✅ @${user} is now trusted; their addon update requests will be approved automatically.`),
+            });
+            if (command === 'ban' || applied) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.issue.number,
+                state: 'closed',
+                state_reason: command === 'ban' ? 'not_planned' : undefined,
+              });
+            }
+
+  bump-request:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null &&
+      contains(github.event.issue.labels.*.name, 'addon-update') &&
+      startsWith(github.event.comment.body, '/bump')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check bump requester
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (context.payload.comment.user.login !== context.payload.issue.user.login) {
+              core.setFailed('Only the issue creator can use /bump.');
+            }
+
+      - uses: actions/checkout@v4
+
+      - name: Check requester is not banned
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const policy = JSON.parse(fs.readFileSync('.github/addon-request-policy.json', 'utf8'));
+            const user = context.payload.issue.user.login;
+            if ((policy.bannedUsers || []).includes(user)) {
+              core.setFailed(`@${user} is banned from addon requests.`);
+            }
+
+      - name: Update issue target ref
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { replaceTargetRef } = require('./scripts/addon-update-request.cjs');
+            const requested = context.payload.comment.body.trim().replace(/^\/bump\s*/i, '').trim();
+            const body = replaceTargetRef(context.payload.issue.body || '', requested);
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body,
+            });
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `🔁 Requested target ref bumped to \`${requested}\`.`,
+            });
+
+  auto-approve-trusted-request:
+    if: >-
+      github.event_name == 'issues' &&
+      contains(github.event.issue.labels.*.name, 'addon-update')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check trust and validation
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { validate } = require('./scripts/addon-update-request.cjs');
+            const policy = JSON.parse(fs.readFileSync('.github/addon-request-policy.json', 'utf8'));
+            const user = context.payload.issue.user.login;
+            const trusted = (policy.trustedUsers || []).includes(user);
+            const banned = (policy.bannedUsers || []).includes(user);
+            const result = validate(context.payload.issue.body || '', { user, trusted, banned });
+            core.setOutput('apply', String(trusted && !banned && result.errors.length === 0));
+
+      - name: Apply trusted marketplace update
+        if: steps.check.outputs.apply == 'true'
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: node scripts/addon-update-request.cjs apply
+
+      - name: Commit trusted marketplace update
+        if: steps.check.outputs.apply == 'true'
+        run: |
+          node scripts/update-addon-issue-template.mjs
+          node scripts/sync-pages-api.mjs
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add marketplace.json api/marketplace.json .github/ISSUE_TEMPLATE/addon-update.yml
+          git commit -m "chore(addons): auto-approve trusted update from issue #${{ github.event.issue.number }}"
+          git push
+
+      - name: Comment and close trusted request
+        if: steps.check.outputs.apply == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: '✅ Trusted requester update was automatically approved and applied.',
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              state: 'closed',
             });
 
   approve-request:
@@ -119,76 +339,29 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Parse issue form
-        id: parse
+      - name: Check requester is not banned
         uses: actions/github-script@v7
         with:
           script: |
-            function parseIssueForm(body) {
-              const fields = {};
-              const regex = /###\s+(.+?)\s*\n+([\s\S]*?)(?=\n###\s+|$)/g;
-              for (const match of body.matchAll(regex)) {
-                fields[match[1].trim().toLowerCase()] = match[2]
-                  .replace(/<!--[\s\S]*?-->/g, '')
-                  .trim();
-              }
-              return fields;
+            const fs = require('fs');
+            const policy = JSON.parse(fs.readFileSync('.github/addon-request-policy.json', 'utf8'));
+            const user = context.payload.issue.user.login;
+            if ((policy.bannedUsers || []).includes(user)) {
+              core.setFailed(`@${user} is banned from addon requests.`);
             }
-            const fields = parseIssueForm(context.payload.issue.body || '');
-            const payload = {
-              addonName: fields['addon name'],
-              repoUrl: fields['repository url'],
-              targetRef: fields['target commit, tag, or branch'],
-              notes: fields['update notes'],
-            };
-            for (const [key, value] of Object.entries(payload)) {
-              if (!value) core.setFailed(`Missing required field: ${key}`);
-            }
-            core.setOutput('payload', JSON.stringify(payload));
 
       - name: Update marketplace file
         env:
-          UPDATE_PAYLOAD: ${{ steps.parse.outputs.payload }}
-        run: |
-          node <<'NODE'
-          const fs = require('fs');
-          const payload = JSON.parse(process.env.UPDATE_PAYLOAD);
-
-          function normalizeUrl(url) {
-            return String(url || '')
-              .trim()
-              .replace(/\.git$/, '')
-              .replace(/\/$/, '')
-              .toLowerCase();
-          }
-
-          const path = 'marketplace.json';
-          const marketplace = JSON.parse(fs.readFileSync(path, 'utf8'));
-          marketplace.addons ||= [];
-          const addon = marketplace.addons.find((entry) => {
-            return entry.name === payload.addonName || normalizeUrl(entry.git || entry.repositoryUrl || entry.url) === normalizeUrl(payload.repoUrl);
-          });
-
-          if (!addon) {
-            throw new Error(`No matching addon found for ${payload.addonName}`);
-          }
-
-          if (normalizeUrl(addon.git || addon.repositoryUrl || addon.url) !== normalizeUrl(payload.repoUrl)) {
-            throw new Error('Repository URL does not match the marketplace entry.');
-          }
-
-          addon.pinnedCommit = payload.targetRef;
-          addon.updatedAt = new Date().toISOString();
-          addon.updateNotes = payload.notes;
-
-          fs.writeFileSync(path, `${JSON.stringify(marketplace, null, 2)}\n`);
-          NODE
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: node scripts/addon-update-request.cjs apply
 
       - name: Commit marketplace update
         run: |
+          node scripts/update-addon-issue-template.mjs
+          node scripts/sync-pages-api.mjs
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add marketplace.json
+          git add marketplace.json api/marketplace.json .github/ISSUE_TEMPLATE/addon-update.yml
           git commit -m "chore(addons): approve update from issue #${{ github.event.issue.number }}"
           git push
 
