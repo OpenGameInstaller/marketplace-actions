@@ -23,12 +23,14 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const { validateUpdate, replaceTargetRef } = require('./scripts/addon-request.cjs');
+            const { validateUpdate, replaceTargetRef, inferRequestType } = require('./scripts/addon-request.cjs');
 
             const body = (context.payload.comment.body || '').trim();
+            const issueBody = context.payload.issue.body || '';
             const command = body.split(/\s+/)[0].toLowerCase();
             const labels = context.payload.issue.labels.map((label) => label.name);
-            const isMarketplaceIssue = labels.includes('addon-update') || labels.includes('addon-create');
+            const requestType = inferRequestType(issueBody, labels);
+            const isMarketplaceIssue = Boolean(requestType);
             const issueUser = context.payload.issue.user.login;
             const commenter = context.payload.comment.user.login;
             const policyPath = '.github/addon-request-policy.json';
@@ -60,7 +62,7 @@ jobs:
               return;
             }
 
-            if ((command === '/approve' || command === '/bump') && !isMarketplaceIssue) {
+            if (!isMarketplaceIssue) {
               core.setFailed(`${command} can only be used on addon marketplace issues.`);
               return;
             }
@@ -83,9 +85,9 @@ jobs:
                 policy.bannedUsers = policy.bannedUsers.filter((entry) => entry !== user);
                 core.setOutput('message', `✅ @${user} is now trusted; their addon update requests will be approved automatically.`);
 
-                const canApplyCurrent = labels.includes('addon-update') && user === issueUser;
+                const canApplyCurrent = requestType === 'update' && user === issueUser;
                 if (canApplyCurrent) {
-                  const result = validateUpdate(context.payload.issue.body || '', { user, trusted: true, banned: false });
+                  const result = validateUpdate(issueBody, { user, trusted: true, banned: false });
                   if (result.errors.length === 0) {
                     core.setOutput('apply', 'true');
                     core.setOutput('close', 'true');
@@ -112,7 +114,7 @@ jobs:
                 return;
               }
               const requested = body.replace(/^\/bump\s*/i, '').trim();
-              const nextBody = replaceTargetRef(context.payload.issue.body || '', requested);
+              const nextBody = replaceTargetRef(issueBody, requested);
               await github.rest.issues.update({
                 owner: context.repo.owner,
                 repo: context.repo.repo,

@@ -240,9 +240,20 @@ function applyCreate(body) {
   return { payload, pinnedCommit };
 }
 
+function inferRequestType(body, labels = []) {
+  if (labels.includes('addon-create')) return 'create';
+  if (labels.includes('addon-update')) return 'update';
+
+  const fields = parseIssueForm(body);
+  if (fields['addon name'] && fields['repository url'] && fields['image url']) return 'create';
+  if (fields['addon id']) return 'update';
+  return '';
+}
+
 function applyByLabel(body, labels = []) {
-  if (labels.includes('addon-create')) return applyCreate(body);
-  if (labels.includes('addon-update')) return applyUpdate(body);
+  const type = inferRequestType(body, labels);
+  if (type === 'create') return applyCreate(body);
+  if (type === 'update') return applyUpdate(body);
   throw new Error('Issue is not an addon creation or update request.');
 }
 
@@ -262,6 +273,7 @@ module.exports = {
   validateCreate,
   applyUpdate,
   applyCreate,
+  inferRequestType,
   applyByLabel,
   replaceTargetRef,
 };
