@@ -138,6 +138,13 @@ function validateUpdate(body, options = {}) {
     '',
     errors.length ? `❌ **Validation failed**\n\n${errors.map((error) => `- ${error}`).join('\n')}` : '✅ **Validation passed**',
     '',
+    '### How this update process works',
+    '',
+    '- If the target ref is blank, approval resolves it to the newest created Git tag commit from the addon repository.',
+    '- Maintainers can approve the update by commenting `/approve`.',
+    '- The issue creator can change the requested ref before approval with `/bump <commit|tag|branch>`.',
+    '- When approved, the workflow updates `marketplace.json`, refreshes the generated Pages API file, commits the change, and closes this issue.',
+    '',
     errors.length ? 'Edit the issue to fix the problems above.' : (options.trusted ? 'Trusted requester: this update will be applied automatically.' : 'A maintainer with write access can approve this update by commenting `/approve`.'),
   ].filter(Boolean).join('\n');
 
@@ -176,6 +183,14 @@ function validateCreate(body, options = {}) {
     `**Requested target:** ${payload.targetRef || '_latest created tag will be resolved on approval_'}`,
     '',
     errors.length ? `❌ **Validation failed**\n\n${errors.map((error) => `- ${error}`).join('\n')}` : '✅ **Validation passed**',
+    '',
+    '### How this submission process works',
+    '',
+    '- Maintainers review the addon metadata, repository, icon, and description.',
+    '- If the target ref is blank, approval resolves it to the newest created Git tag commit from the addon repository.',
+    '- Maintainers can add the addon by commenting `/approve`.',
+    '- The issue creator can change the requested ref before approval with `/bump <commit|tag|branch>`.',
+    '- When approved, the workflow adds the addon to `marketplace.json`, refreshes the generated Pages API file, commits the change, and closes this issue.',
     '',
     errors.length ? 'Edit the issue to fix the problems above.' : 'A maintainer with write access can add this addon by commenting `/approve`.',
   ].filter(Boolean).join('\n');
